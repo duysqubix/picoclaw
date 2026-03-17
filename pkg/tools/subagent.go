@@ -9,6 +9,22 @@ import (
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
 
+// SubTurnSpawner is an interface for spawning sub-turns.
+// This avoids circular dependency between tools and agent packages.
+type SubTurnSpawner interface {
+	SpawnSubTurn(ctx context.Context, cfg SubTurnConfig) (*ToolResult, error)
+}
+
+// SubTurnConfig holds configuration for spawning a sub-turn.
+type SubTurnConfig struct {
+	Model        string
+	Tools        []Tool
+	SystemPrompt string
+	MaxTokens    int
+	Temperature  float64
+	Async        bool // true for async (spawn), false for sync (subagent)
+}
+
 type SubagentTask struct {
 	ID            string
 	Task          string
@@ -251,14 +267,25 @@ func (sm *SubagentManager) ListTasks() []*SubagentTask {
 }
 
 // SubagentTool executes a subagent task synchronously and returns the result.
+// It directly calls SubTurnSpawner with Async=false for synchronous execution.
 type SubagentTool struct {
-	manager *SubagentManager
+	spawner      SubTurnSpawner
+	defaultModel string
+	maxTokens    int
+	temperature  float64
 }
 
 func NewSubagentTool(manager *SubagentManager) *SubagentTool {
 	return &SubagentTool{
-		manager: manager,
+		defaultModel: manager.defaultModel,
+		maxTokens:    manager.maxTokens,
+		temperature:  manager.temperature,
 	}
+}
+
+// SetSpawner sets the SubTurnSpawner for direct sub-turn execution.
+func (t *SubagentTool) SetSpawner(spawner SubTurnSpawner) {
+	t.spawner = spawner
 }
 
 func (t *SubagentTool) Name() string {
@@ -294,115 +321,58 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]any) *ToolRe
 
 	label, _ := args["label"].(string)
 
-	if t.manager == nil {
-		return ErrorResult("Subagent manager not configured").WithError(fmt.Errorf("manager is nil"))
+	// Build system prompt for subagent
+	systemPrompt := fmt.Sprintf(`You are a subagent. Complete the given task independently and provide a clear, concise result.
+
+Task: %s`, task)
+
+	if label != "" {
+		systemPrompt = fmt.Sprintf(`You are a subagent labeled "%s". Complete the given task independently and provide a clear, concise result.
+
+Task: %s`, label, task)
 	}
 
-	sm := t.manager
-	sm.mu.RLock()
-	spawner := sm.spawner
-	tools := sm.tools
-	maxIter := sm.maxIterations
-	maxTokens := sm.maxTokens
-	temperature := sm.temperature
-	hasMaxTokens := sm.hasMaxTokens
-	hasTemperature := sm.hasTemperature
-	sm.mu.RUnlock()
+	// Use spawner if available (direct SpawnSubTurn call)
+	if t.spawner != nil {
+		result, err := t.spawner.SpawnSubTurn(ctx, SubTurnConfig{
+			Model:        t.defaultModel,
+			Tools:        nil, // Will inherit from parent via context
+			SystemPrompt: systemPrompt,
+			MaxTokens:    t.maxTokens,
+			Temperature:  t.temperature,
+			Async:        false, // Synchronous execution
+		})
 
-	if spawner != nil {
-		// Use spawner
-		res, err := spawner(ctx, task, label, "", tools, maxTokens, temperature, hasMaxTokens, hasTemperature)
 		if err != nil {
 			return ErrorResult(fmt.Sprintf("Subagent execution failed: %v", err)).WithError(err)
 		}
-		
-		// Ensure synchronous ForUser display truncates
-		userContent := res.ForLLM
-		if res.ForUser != "" {
-			userContent = res.ForUser
+
+		// Format result for display
+		userContent := result.ForLLM
+		if result.ForUser != "" {
+			userContent = result.ForUser
 		}
 		maxUserLen := 500
 		if len(userContent) > maxUserLen {
 			userContent = userContent[:maxUserLen] + "..."
 		}
-		
+
 		labelStr := label
 		if labelStr == "" {
 			labelStr = "(unnamed)"
 		}
 		llmContent := fmt.Sprintf("Subagent task completed:\nLabel: %s\nResult: %s",
-			labelStr, res.ForLLM)
-			
+			labelStr, result.ForLLM)
+
 		return &ToolResult{
-			ForLLM: llmContent,
+			ForLLM:  llmContent,
 			ForUser: userContent,
-			Silent: false,
-			IsError: res.IsError,
-			Async: false,
+			Silent:  false,
+			IsError: result.IsError,
+			Async:   false,
 		}
 	}
 
-	// Build messages for subagent fallback
-	messages := []providers.Message{
-		{
-			Role:    "system",
-			Content: "You are a subagent. Complete the given task independently and provide a clear, concise result.",
-		},
-		{
-			Role:    "user",
-			Content: task,
-		},
-	}
-
-	var llmOptions map[string]any
-	if hasMaxTokens || hasTemperature {
-		llmOptions = map[string]any{}
-		if hasMaxTokens {
-			llmOptions["max_tokens"] = maxTokens
-		}
-		if hasTemperature {
-			llmOptions["temperature"] = temperature
-		}
-	}
-
-	channel := ToolChannel(ctx)
-	if channel == "" {
-		channel = "cli"
-	}
-	chatID := ToolChatID(ctx)
-	if chatID == "" {
-		chatID = "direct"
-	}
-
-	loopResult, err := RunToolLoop(ctx, ToolLoopConfig{
-		Provider:      sm.provider,
-		Model:         sm.defaultModel,
-		Tools:         tools,
-		MaxIterations: maxIter,
-		LLMOptions:    llmOptions,
-	}, messages, channel, chatID)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("Subagent execution failed: %v", err)).WithError(err)
-	}
-
-	userContent := loopResult.Content
-	maxUserLen := 500
-	if len(userContent) > maxUserLen {
-		userContent = userContent[:maxUserLen] + "..."
-	}
-
-	labelStr := label
-	if labelStr == "" {
-		labelStr = "(unnamed)"
-	}
-	llmContent := fmt.Sprintf("Subagent task completed:\nLabel: %s\nIterations: %d\nResult: %s",
-		labelStr, loopResult.Iterations, loopResult.Content)
-
-	return &ToolResult{
-		ForLLM:  llmContent,
-		ForUser: userContent,
-		Silent:  false,
-		IsError: false,
-		Async:   false,
-	}
+	// Fallback: spawner not configured
+	return ErrorResult("SubagentTool: spawner not configured - call SetSpawner() during initialization").WithError(fmt.Errorf("spawner not set"))
 }
