@@ -44,25 +44,19 @@ type sessionListItem struct {
 	Updated      string `json:"updated"`
 }
 
-// picoSessionPrefix is the key prefix used by the gateway's routing for Pico
-// channel sessions. The full key format is:
-//
-//	agent:main:pico:direct:pico:<session-uuid>
-//
-// The sanitized filename replaces ':' with '_', so on disk it becomes:
-//
-//	agent_main_pico_direct_pico_<session-uuid>.json
+// legacyPicoSessionPrefix is the legacy key prefix used by older Pico JSON/JSONL
+// sessions before structured scope metadata existed.
 const (
-	picoSessionPrefix       = "agent:main:pico:direct:pico:"
+	legacyPicoSessionPrefix = "agent:main:pico:direct:pico:"
 	maxSessionJSONLLineSize = 10 * 1024 * 1024 // 10 MB
 	maxSessionTitleRunes    = 60
 )
 
-// extractPicoSessionID extracts the session UUID from a full session key.
+// extractLegacyPicoSessionID extracts the session UUID from an old Pico key.
 // Returns the UUID and true if the key matches the Pico session pattern.
-func extractPicoSessionID(key string) (string, bool) {
-	if strings.HasPrefix(key, picoSessionPrefix) {
-		return strings.TrimPrefix(key, picoSessionPrefix), true
+func extractLegacyPicoSessionID(key string) (string, bool) {
+	if strings.HasPrefix(key, legacyPicoSessionPrefix) {
+		return strings.TrimPrefix(key, legacyPicoSessionPrefix), true
 	}
 	return "", false
 }
@@ -74,8 +68,7 @@ func sanitizeSessionKey(key string) string {
 	return key
 }
 
-func (h *Handler) readLegacySession(dir, sessionID string) (sessionFile, error) {
-	path := filepath.Join(dir, sanitizeSessionKey(picoSessionPrefix+sessionID)+".json")
+func (h *Handler) readLegacySession(path string) (sessionFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return sessionFile{}, err
@@ -184,6 +177,11 @@ type picoJSONLSessionRef struct {
 	Key string
 }
 
+type picoLegacySessionRef struct {
+	ID   string
+	Path string
+}
+
 func extractPicoSessionIDFromScope(scope session.SessionScope) (string, bool) {
 	if !strings.EqualFold(strings.TrimSpace(scope.Channel), "pico") {
 		return "", false
@@ -208,15 +206,15 @@ func extractPicoSessionIDFromScope(scope session.SessionScope) (string, bool) {
 }
 
 func sessionRefFromMeta(meta memory.SessionMeta) (picoJSONLSessionRef, bool) {
-	if sessionID, ok := extractPicoSessionID(meta.Key); ok {
-		return picoJSONLSessionRef{ID: sessionID, Key: meta.Key}, true
-	}
-	for _, alias := range meta.Aliases {
-		if sessionID, ok := extractPicoSessionID(alias); ok {
+	if len(meta.Scope) == 0 {
+		if sessionID, ok := extractLegacyPicoSessionID(meta.Key); ok {
 			return picoJSONLSessionRef{ID: sessionID, Key: meta.Key}, true
 		}
-	}
-	if len(meta.Scope) == 0 {
+		for _, alias := range meta.Aliases {
+			if sessionID, ok := extractLegacyPicoSessionID(alias); ok {
+				return picoJSONLSessionRef{ID: sessionID, Key: meta.Key}, true
+			}
+		}
 		return picoJSONLSessionRef{}, false
 	}
 	var scope session.SessionScope
@@ -225,6 +223,14 @@ func sessionRefFromMeta(meta memory.SessionMeta) (picoJSONLSessionRef, bool) {
 	}
 	sessionID, ok := extractPicoSessionIDFromScope(scope)
 	if !ok {
+		if legacySessionID, ok := extractLegacyPicoSessionID(meta.Key); ok {
+			return picoJSONLSessionRef{ID: legacySessionID, Key: meta.Key}, true
+		}
+		for _, alias := range meta.Aliases {
+			if legacySessionID, ok := extractLegacyPicoSessionID(alias); ok {
+				return picoJSONLSessionRef{ID: legacySessionID, Key: meta.Key}, true
+			}
+		}
 		return picoJSONLSessionRef{}, false
 	}
 	return picoJSONLSessionRef{ID: sessionID, Key: meta.Key}, true
@@ -271,6 +277,51 @@ func (h *Handler) findPicoJSONLSession(dir, sessionID string) (picoJSONLSessionR
 		}
 	}
 	return picoJSONLSessionRef{}, os.ErrNotExist
+}
+
+func (h *Handler) findLegacyPicoSessions(dir string) ([]picoLegacySessionRef, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	refs := make([]picoLegacySessionRef, 0)
+	seen := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		sess, err := h.readLegacySession(path)
+		if err != nil || isEmptySession(sess) {
+			continue
+		}
+
+		sessionID, ok := extractLegacyPicoSessionID(sess.Key)
+		if !ok || sessionID == "" {
+			continue
+		}
+		if _, exists := seen[sessionID]; exists {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		refs = append(refs, picoLegacySessionRef{ID: sessionID, Path: path})
+	}
+	return refs, nil
+}
+
+func (h *Handler) findLegacyPicoSession(dir, sessionID string) (picoLegacySessionRef, error) {
+	refs, err := h.findLegacyPicoSessions(dir)
+	if err != nil {
+		return picoLegacySessionRef{}, err
+	}
+	for _, ref := range refs {
+		if ref.ID == sessionID {
+			return ref, nil
+		}
+	}
+	return picoLegacySessionRef{}, os.ErrNotExist
 }
 
 func buildSessionListItem(sessionID string, sess sessionFile) sessionListItem {
@@ -365,8 +416,7 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	if _, err := os.ReadDir(dir); err != nil {
 		// Directory doesn't exist yet = no sessions
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode([]sessionListItem{})
@@ -387,42 +437,18 @@ func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	if legacyRefs, findErr := h.findLegacyPicoSessions(dir); findErr == nil {
+		for _, ref := range legacyRefs {
+			if _, exists := seen[ref.ID]; exists {
+				continue
+			}
+			sess, loadErr := h.readLegacySession(ref.Path)
+			if loadErr != nil || isEmptySession(sess) {
+				continue
+			}
+			seen[ref.ID] = struct{}{}
+			items = append(items, buildSessionListItem(ref.ID, sess))
 		}
-		name := entry.Name()
-		if strings.HasSuffix(name, ".meta.json") || filepath.Ext(name) != ".json" {
-			continue
-		}
-
-		base := strings.TrimSuffix(name, ".json")
-		if _, statErr := os.Stat(filepath.Join(dir, base+".jsonl")); statErr == nil {
-			continue
-		}
-
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			continue
-		}
-
-		var sess sessionFile
-		if err := json.Unmarshal(data, &sess); err != nil {
-			continue
-		}
-		if isEmptySession(sess) {
-			continue
-		}
-		sessionID, ok := extractPicoSessionID(sess.Key)
-		if !ok {
-			continue
-		}
-		if _, exists := seen[sessionID]; exists {
-			continue
-		}
-
-		seen[sessionID] = struct{}{}
-		items = append(items, buildSessionListItem(sessionID, sess))
 	}
 
 	// Sort by updated descending (most recent first)
@@ -487,7 +513,9 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			sess, err = h.readLegacySession(dir, sessionID)
+			if legacyRef, legacyErr := h.findLegacyPicoSession(dir, sessionID); legacyErr == nil {
+				sess, err = h.readLegacySession(legacyRef.Path)
+			}
 			if err == nil && isEmptySession(sess) {
 				err = os.ErrNotExist
 			}
@@ -560,14 +588,15 @@ func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	legacyPath := filepath.Join(dir, sanitizeSessionKey(picoSessionPrefix+sessionID)+".json")
-	if err := os.Remove(legacyPath); err != nil {
-		if !os.IsNotExist(err) {
-			http.Error(w, "failed to delete session", http.StatusInternalServerError)
-			return
+	if legacyRef, err := h.findLegacyPicoSession(dir, sessionID); err == nil {
+		if err := os.Remove(legacyRef.Path); err != nil {
+			if !os.IsNotExist(err) {
+				http.Error(w, "failed to delete session", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			removed = true
 		}
-	} else {
-		removed = true
 	}
 
 	if !removed {
