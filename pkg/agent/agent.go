@@ -39,9 +39,10 @@ type AgentLoop struct {
 	state    *state.Manager
 
 	// Runtime event system
-	runtimeEvents     runtimeevents.Bus
-	ownsRuntimeEvents bool
-	hooks             *HookManager
+	runtimeEvents      runtimeevents.Bus
+	ownsRuntimeEvents  bool
+	runtimeEventLogSub runtimeevents.Subscription
+	hooks              *HookManager
 
 	// Runtime state
 	running        atomic.Bool
@@ -284,6 +285,9 @@ func (al *AgentLoop) Close() {
 	al.GetRegistry().Close()
 	if al.hooks != nil {
 		al.hooks.Close()
+	}
+	if al.runtimeEventLogSub != nil {
+		_ = al.runtimeEventLogSub.Close()
 	}
 	if al.runtimeEvents != nil && al.ownsRuntimeEvents {
 		if err := al.runtimeEvents.Close(); err != nil {
