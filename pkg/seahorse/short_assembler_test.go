@@ -145,22 +145,29 @@ func TestAssemblerBudgetEvictsOldest(t *testing.T) {
 	s.UpsertContextItems(ctx, convID, items)
 
 	// Budget of 200 tokens with FreshTailCount=32
-	// Fresh tail = last 32 messages (320 tokens, over budget, but always included)
+	// Fresh tail = last 32 messages (320 tokens, over budget)
 	// Evictable = first 8 messages (80 tokens)
-	// Budget after tail: max(0, 200-320) = 0 → no evictable items included
+	// The oldest messages from the fresh tail should be dropped so only the
+	// newest 20 messages remain within the 200-token budget.
 	a := &Assembler{store: s, config: Config{}}
 	result, err := a.Assemble(ctx, convID, AssembleInput{Budget: 200})
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
 	}
 
-	// Should only include the 32-item fresh tail
-	if len(result.Messages) != 32 {
-		t.Errorf("Messages = %d, want 32 (fresh tail)", len(result.Messages))
+	if len(result.Messages) != 20 {
+		t.Errorf("Messages = %d, want 20", len(result.Messages))
 	}
-	// Should be the LAST 32 messages
-	if result.Messages[0].ID != msgs[8].ID {
-		t.Errorf("first message ID = %d, want %d (msgs[8])", result.Messages[0].ID, msgs[8].ID)
+	if result.Messages[0].ID != msgs[20].ID {
+		t.Errorf("first message ID = %d, want %d (msgs[20])", result.Messages[0].ID, msgs[20].ID)
+	}
+
+	totalTokens := 0
+	for _, msg := range result.Messages {
+		totalTokens += msg.TokenCount
+	}
+	if totalTokens > 200 {
+		t.Errorf("assembled tokens = %d, want <= 200", totalTokens)
 	}
 }
 

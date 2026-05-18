@@ -68,19 +68,24 @@ func (a *Assembler) Assemble(ctx context.Context, convID int64, input AssembleIn
 		freshTailTokens += r.tokenCount
 	}
 
-	// Budget-aware selection of evictable items
-	remainingBudget := input.Budget - freshTailTokens
-	if remainingBudget < 0 {
-		// Fresh tail alone exceeds budget - we keep it anyway (design decision)
-		// Log for debugging retry/overflow issues
-		logger.InfoCF("seahorse", "assemble: fresh tail exceeds budget", map[string]any{
-			"budget":            input.Budget,
-			"fresh_tail_tokens": freshTailTokens,
-			"fresh_tail_count":  len(freshTail),
-			"over_budget_by":    freshTailTokens - input.Budget,
+	// If the protected tail alone exceeds budget, trim from the oldest end of
+	// the tail until the newest items fit within the requested budget.
+	if freshTailTokens > input.Budget {
+		originalTailCount := len(freshTail)
+		originalFreshTailTokens := freshTailTokens
+		for freshTailTokens > input.Budget && len(freshTail) > 0 {
+			freshTailTokens -= freshTail[0].tokenCount
+			freshTail = freshTail[1:]
+		}
+		logger.InfoCF("seahorse", "assemble: trimmed fresh tail to budget", map[string]any{
+			"budget":                input.Budget,
+			"fresh_tail_tokens":     freshTailTokens,
+			"fresh_tail_count":      len(freshTail),
+			"trimmed_fresh_items":   originalTailCount - len(freshTail),
+			"original_fresh_tokens": originalFreshTailTokens,
 		})
-		remainingBudget = 0
 	}
+	remainingBudget := input.Budget - freshTailTokens
 
 	var selected []resolvedItem
 	evictableTokens := 0
