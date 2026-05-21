@@ -560,6 +560,7 @@ func sideQuestionModelName(agent *AgentInstance, usedLight bool) string {
 }
 
 func modelNameFromIdentityKey(identityKey string) string {
+	identityKey = strings.TrimSpace(identityKey)
 	if identityKey == "" {
 		return ""
 	}
